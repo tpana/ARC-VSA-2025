@@ -1,7 +1,6 @@
 # Isaac Joffe, 2025
 # Defines VSA setup for representation
 
-
 # VSA-related dependencies
 import numpy as np
 import nengo_spa as spa
@@ -11,6 +10,8 @@ from sklearn.mixture import GaussianMixture
 # General helpers
 from PIL import ImageColor
 import random
+
+from scipy.optimize import *
 
 # Control how random behaviour is set
 SEED = 0
@@ -26,7 +27,7 @@ N_COLOURS = 10        # Black, blue, red, green, yellow, gray, pink, orange, cya
 MAX_GRID_SIZE = 30    # At most 30x30 size grids
 
 # VSA hyperparameters
-N_DIMENSIONS = 4096          # How many dimensions to use in embedding
+N_DIMENSIONS = int(8192/2)          # How many dimensions to use in embedding
 LENGTH_SCALE = 0.25           # How 'blurred' to make all representations
 
 # System hyperparameters
@@ -189,9 +190,61 @@ FEATURE_SPS = SP_SPACE.vectors[(MAX_N_OBJECTS):(MAX_N_OBJECTS + N_FEATURES)]
 COLOUR_SPS = SP_SPACE.vectors[(MAX_N_OBJECTS + N_FEATURES):(MAX_N_OBJECTS + N_FEATURES + N_COLOURS)]
 NUMBER_SPS = SP_SPACE.vectors[(MAX_N_OBJECTS + N_FEATURES + N_COLOURS):]
 
+# Compatibility wrapper: provides old RandomSSPSpace interface over new sspspace API
+# -----------------------------------------------------------------------------
+class CompatSSPSpace:
+    """
+    Wraps the new sspspace API (SSPEncoder + top-level bind/invert + SSPSimilarityDecoder)
+    to match the interface expected by this codebase (bind/invert/decode/get_sample_pts_and_ssps
+    as methods on the space object).
+    """
+    def __init__(self, domain_dim, ssp_dim, domain_bounds, length_scale, rng, **kwargs):
+        # kwargs absorbs deprecated params like 'sampler' without error
+        self._encoder = sspspace.RandomSSPSpace(
+            domain_dim=domain_dim,
+            ssp_dim=ssp_dim,
+            length_scale=length_scale,
+            rng=rng,
+        )
+        self._domain_bounds = np.array(domain_bounds)
+        self._decoder = None
+
+    def encode(self, x):
+        """Encode point(s). Input (2,) or (N,2); returns (1,D) or (N,D)."""
+        return self._encoder.encode(np.atleast_2d(x))
+
+    def bind(self, a, b):
+        """Circular convolution (HRR binding). Pure numpy, no SSP object needed."""
+        a_flat = np.asarray(a, dtype=float).flatten()
+        b_flat = np.asarray(b, dtype=float).flatten()
+        return np.real(np.fft.ifft(np.fft.fft(a_flat) * np.fft.fft(b_flat)))
+
+    def invert(self, a):
+        """HRR approximate inverse: [a[0], a[n-1], a[n-2], ..., a[1]]. Pure numpy."""
+        a_flat = np.asarray(a, dtype=float).flatten()
+        return a_flat[-np.arange(len(a_flat))]
+
+    def get_sample_pts_and_ssps(self, num_points_per_dim):
+        """Build uniform sample grid over domain; initialises the decoder."""
+        xs = np.linspace(self._domain_bounds[0, 0], self._domain_bounds[0, 1], num_points_per_dim)
+        ys = np.linspace(self._domain_bounds[1, 0], self._domain_bounds[1, 1], num_points_per_dim)
+        XX, YY = np.meshgrid(xs, ys)
+        sim_xs = np.column_stack([XX.ravel(), YY.ravel()])  # (N*N, 2)
+        sim_ssps = self._encoder.encode(sim_xs)              # (N*N, D)
+        self._decoder = sspspace.SSPSimilarityDecoder(sim_xs, sim_ssps, self._encoder)
+        return (sim_xs, sim_ssps)  # kept for API compatibility; decode ignores it
+
+    def decode(self, x, samples=None):
+        """Decode SSP to nearest sample point. Returns shape (1, 2)."""
+        if self._decoder is None:
+            raise RuntimeError("Call get_sample_pts_and_ssps before decode.")
+        result = self._decoder.decode(np.atleast_2d(x))
+        return np.atleast_2d(result)  # ensure (1, 2) as callers expect
+# -----------------------------------------------------------------------------
+
 # Set up SSP space
 DOMAIN_BOUNDS = np.array([[-MAX_GRID_SIZE / 2, MAX_GRID_SIZE / 2], [-MAX_GRID_SIZE / 2, MAX_GRID_SIZE / 2]])
-SSP_SPACE = sspspace.RandomSSPSpace(
+SSP_SPACE = CompatSSPSpace(
     domain_dim=2,
     ssp_dim=N_DIMENSIONS,
     domain_bounds=DOMAIN_BOUNDS,
@@ -209,16 +262,16 @@ SAMPLES = SSP_SPACE.get_sample_pts_and_ssps(num_points_per_dim=(2 * MAX_GRID_SIZ
 # -----------------------------------------------------------------------------
 # Mapping from ARC colours to printable symbols
 COLOUR_MAP = {
-    0: "\N{Black Large Square}",
-    1: "\N{Large Blue Square}",
-    2: "\N{Large Red Square}",
-    3: "\N{Large Green Square}",
-    4: "\N{Large Yellow Square}",
-    5: "\U0001FA76",
-    6: "\U0001FA77",
-    7: "\N{Large Orange Square}",
-    8: "\U0001FA75",
-    9: "\N{Large Purple Square}",
+    0: "⬛",  # black
+    1: "🟦",  # blue
+    2: "🟥",  # red
+    3: "🟩",  # green
+    4: "🟨",  # yellow
+    5: "⬜",  # grey  (white square — closest reliably 2-wide option)
+    6: "🟣",  # pink  (purple circle — not perfect but consistently wide)
+    7: "🟧",  # orange
+    8: "🔷",  # cyan  (large blue diamond — reliably 2-wide)
+    9: "🟫",  # maroon (brown square)
 }
 
 # Mapping from ARC colours to displayable colours
@@ -525,26 +578,58 @@ def cleanup_shape(shape_ssp, centre_ssp, size_ssp):
     cleaned_shape_ssp = normalize(SSP_SPACE.bind(cleaned_position_ssp, SSP_SPACE.invert(cleaned_centre_ssp)).flatten())
     return cleaned_shape_indices, cleaned_shape_ssp
 
+# permissive candidate cutoff: below the lowest true-pixel similarity (observed >=0.08
+# even for 49-px dense blocks) and above pure cross-talk noise. Over-inclusion only
+# costs a little NNLS time; it must never exclude a real pixel.
+POSITION_CANDIDATE_THRESHOLD = 0.02
+# keep candidate cells whose NNLS weight exceeds this fraction of the max weight.
+POSITION_WEIGHT_FRACTION = 0.40
+ 
+# cache of per-grid-size cell-SSP dictionaries (built once per (n_rows, n_cols))
+_POSITION_CELL_CACHE = {}
+ 
+def _position_cell_dictionary(n_rows, n_cols):
+    key = (n_rows, n_cols)
+    if key not in _POSITION_CELL_CACHE:
+        cells = [(i, j) for i in range(n_rows) for j in range(n_cols)]
+        dictionary = np.array([
+            SSP_SPACE.encode([j - (n_cols - 1) / 2, (n_rows - 1) / 2 - i]).flatten()
+            for (i, j) in cells
+        ])  # (n_cells, N_DIMENSIONS)
+        _POSITION_CELL_CACHE[key] = (cells, dictionary)
+    return _POSITION_CELL_CACHE[key]
 
 # Clean up SP to an SSP bundle
 def cleanup_position(position_ssp, size_ssp):
-    # Get similarity of each pixel in the grid to the position representation
     n_rows, _, n_cols, _ = cleanup_size(size_ssp)
-    sims = np.zeros((n_rows, n_cols))
-    for i in range(n_rows):
-        for j in range(n_cols):
-            sims[i][j] = np.dot(position_ssp.flatten(), SSP_SPACE.encode([j - (n_cols - 1) / 2, (n_rows - 1) / 2 - i]).flatten())
-    threshold = compute_threshold(sims)
-
-    # Dynamically threshold the representation similarity to get the set of pixels
+    cells, dictionary = _position_cell_dictionary(n_rows, n_cols)
+    query = np.asarray(position_ssp).flatten()
+ 
     cleaned_position_indices = []
     cleaned_position_ssp = np.zeros((N_DIMENSIONS))
-    for i in range(n_rows):
-        for j in range(n_cols):
-            if sims[i][j] > threshold:
-                cleaned_position_indices.append((i, j))
-                cleaned_position_ssp += SSP_SPACE.encode([j - (n_cols - 1) / 2, (n_rows - 1) / 2 - i]).flatten()
+ 
+    # Stage 1 — cheap similarity field -> permissive candidate superset
+    sims = dictionary @ query
+    candidate = np.where(sims > POSITION_CANDIDATE_THRESHOLD)[0]
+    if candidate.size == 0:
+        return cleaned_position_indices, cleaned_position_ssp
+ 
+    # Stage 2 — recover the support over candidates by non-negative least squares
+    weights, _ = nnls(dictionary[candidate].T, query)
+    w_max = weights.max() if weights.size else 0.0
+    if w_max <= 0.0:
+        return cleaned_position_indices, cleaned_position_ssp
+ 
+    for t, k in enumerate(candidate):
+        if weights[t] > POSITION_WEIGHT_FRACTION * w_max:
+            i, j = cells[k]
+            cleaned_position_indices.append((i, j))
+            cleaned_position_ssp += SSP_SPACE.encode(
+                [j - (n_cols - 1) / 2, (n_rows - 1) / 2 - i]
+            ).flatten()
+ 
     return cleaned_position_indices, cleaned_position_ssp
+
 
 
 # Reconstruct pixel grid from scene SSP bundle

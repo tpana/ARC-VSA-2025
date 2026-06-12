@@ -70,6 +70,30 @@ GROW_OPERATION_N_PARAMETERS = 1
 FILL_OPERATION_N_PARAMETERS = 0
 HOLLOW_OPERATION_N_PARAMETERS = 0
 
+# HyPRA Phase 5 — grid-level reorientation (meta-operation, not in DSL pipeline)
+# NOTE: N_OPERATIONS stays 11 (IDs 0-10 = standard DSL ops).
+#       REORIENT (ID 11) exists outside the hitting-set / abduce machinery.
+REORIENT_OPERATION_ID          = 11
+REORIENT_OPERATION_PRIORITY    = 0   # conceptually first (pre-processing)
+REORIENT_OPERATION_SIMPLICITY  = 1
+REORIENT_OPERATION_N_PARAMETERS = 1  # the dihedral transform index
+
+# HyPRA Object-Relations level — wall-boundary relation made executable.
+# GrowToBoundary projects an object toward a grid wall, filling empty cells and
+# skipping occupied ones, until the edge. The line's extent is therefore READ
+# OFF the grid boundary at execution time rather than stored as a fixed shape,
+# so a single direction-only parameter generalises across grid sizes. This is
+# the Object-Relations counterpart to REORIENT: a real abduction operation
+# (it participates in the hitting set), discovered by program_heuristic.
+# ID 12 (REORIENT holds 11). N_OPERATIONS is left at 11 to mirror the codebase's
+# treatment of post-baseline extension ops; the abduction operates on the
+# candidate set returned by program_heuristic, not on range(N_OPERATIONS).
+# (If the solver/NN ever indexes ops by id < N_OPERATIONS, bump it and include 12.)
+GROW_TO_BOUNDARY_OPERATION_ID           = 12
+GROW_TO_BOUNDARY_OPERATION_PRIORITY     = 5   # after IDENTITY (2): the occluder must be placed first
+GROW_TO_BOUNDARY_OPERATION_SIMPLICITY   = 2   # one directional param — far cheaper than GENERATE (5)
+GROW_TO_BOUNDARY_OPERATION_N_PARAMETERS = 1   # the direction toward the wall
+
 # Mapping from operation identifiers to printable names
 OPERATION_MAP = {
     GENERATE_OPERATION_ID: "Generate",
@@ -83,9 +107,16 @@ OPERATION_MAP = {
     GROW_OPERATION_ID: "Grow",
     FILL_OPERATION_ID: "Fill",
     HOLLOW_OPERATION_ID: "Hollow",
+    
+    REORIENT_OPERATION_ID: "Reorient",   # HyPRA Phase 5
+    GROW_TO_BOUNDARY_OPERATION_ID: "GrowToBoundary",   # HyPRA Object-Relations
 }
 # -----------------------------------------------------------------------------
 
+# ── Ablation toggle (eval harness; default True = frozen behaviour) ───────────
+# Flipped by the results script to disable the Object-Relations wall-boundary
+# proposal in program_heuristic. Default True = abduction byte-for-byte unchanged.
+ENABLE_GROW_TO_BOUNDARY = True
 
 # Standard way of representing a DSL operation with associated data
 # -----------------------------------------------------------------------------
@@ -503,6 +534,71 @@ class GrowOperation(ARCOperation):
 # -----------------------------------------------------------------------------
 
 
+# Object-Relations programs
+# -----------------------------------------------------------------------------
+# Grow-to-boundary (project to wall) operation
+class GrowToBoundaryOperation(ARCOperation):
+    # Parameter is the representation of the direction to project toward the wall
+    def __init__(self, input_object_representation=None, input_parameters_representation=[np.zeros((N_DIMENSIONS))]):
+        super().__init__(
+            GROW_TO_BOUNDARY_OPERATION_ID,
+            GROW_TO_BOUNDARY_OPERATION_PRIORITY,
+            GROW_TO_BOUNDARY_OPERATION_SIMPLICITY,
+            GROW_TO_BOUNDARY_OPERATION_N_PARAMETERS,
+            input_object_representation,
+            input_parameters_representation,
+        )
+        return
+
+    # Reproduce an object, projected from each of its pixels toward the grid wall
+    # in the given direction: EMPTY cells of the in-progress grid are filled, cells
+    # already OCCUPIED by previously-placed objects are skipped (the ray passes over
+    # them), and the ray stops at the grid edge. Because the extent is determined by
+    # the wall position rather than by a stored shape, the operation generalises
+    # across grid sizes. Skipping occupied cells yields the object exactly as the
+    # COLOUR segmentation sees it when an occluder (e.g. an arrowhead) punches a gap
+    # through the projected object, and leaves that occluder's pixels untouched.
+    def execute(self):
+        input_colour = cleanup_colour(self.input_object_representation.get_colour_representation())[0]
+        input_centre = cleanup_centre(self.input_object_representation.get_centre_representation())[1]
+        input_shape = self.input_object_representation.get_shape_representation()
+        input_position = cleanup_position(SSP_SPACE.bind(input_centre, input_shape), self.get_input_grid_size_representation())[0]
+
+        # Convert representation of old position to grid-pixel space
+        n_rows, _, n_cols, _ = cleanup_size(self.get_input_grid_size_representation())
+        grid = np.zeros((n_rows, n_cols))
+        for i in range(n_rows):
+            for j in range(n_cols):
+                if ((i, j) in input_position):
+                    grid[i][j] = 1
+
+        # Determine which way to project toward the wall
+        direction_coordinates = cleanup_centre(self.input_parameters_representation[0])[0]
+        horizontal_diff = int(direction_coordinates[0][0])
+        vertical_diff = -int(direction_coordinates[0][1])
+
+        # Project a ray from each seed pixel toward the grid boundary, filling empty
+        # cells and skipping occupied ones, until the edge is reached
+        if (horizontal_diff != 0 or vertical_diff != 0):
+            current_grid = self.get_current_grid()
+            seeds = [(i, j) for i in range(n_rows) for j in range(n_cols) if grid[i][j]]
+            for (i, j) in seeds:
+                r, c = i + vertical_diff, j + horizontal_diff
+                n_steps = 0
+                while (0 <= r < n_rows) and (0 <= c < n_cols) and (n_steps <= MAX_GRID_SIZE):
+                    # skip cells already occupied by previously-placed objects; the
+                    # ray continues over them rather than stopping
+                    if (current_grid is None) or (not current_grid.get_pixel(r, c)):
+                        grid[r][c] = 1
+                    r += vertical_diff
+                    c += horizontal_diff
+                    n_steps += 1
+
+        output_object_representation = ARCObject(*encode_object(grid, input_colour))
+        return output_object_representation
+# -----------------------------------------------------------------------------
+
+
 # Special shape-based programs
 # -----------------------------------------------------------------------------
 # Fill (connect) operation
@@ -612,7 +708,53 @@ class HollowOperation(ARCOperation):
         )
         return output_object_representation
 # -----------------------------------------------------------------------------
+# (would subclass ARCOperation in the actual file)
+    """
+    HyPRA Phase 5 — Grid-level dihedral reorientation.
+ 
+    Design rationale
+    ----------------
+    The actual reorientation is a pixel-level operation performed by
+    hypra/inference/normalisation.py BEFORE the VSA pipeline runs.
+    ReorientOperation exists in programs.py to:
+      (a) give the operation a DSL identity and printable name for traces,
+      (b) enable future integration where REORIENT is discovered by the
+          abduction loop and directly applied in deduce_output(),
+      (c) record which dihedral element T was selected by the AIN policy
+          (stored as a 1-element numpy array in input_parameters_representation).
+ 
+    execute() is a no-op (identity on the object): the grid transform has
+    already been applied at the pixel level before this object was perceived.
+    N_OPERATIONS is NOT incremented; REORIENT is outside the hitting-set search.
+ 
+    Future work (AAAI scope): per-object ReorientOperation where T_i is
+    selected per-object rather than per-grid, enabling tasks like 508bd3b6.
+    """
+class ReorientOperation(ARCOperation):
+    def __init__(self,
+                    input_object_representation=None,
+                    input_parameters_representation=[np.zeros(N_DIMENSIONS)]):
+        super().__init__(
+            REORIENT_OPERATION_ID,
+            REORIENT_OPERATION_PRIORITY,
+            REORIENT_OPERATION_SIMPLICITY,
+            REORIENT_OPERATION_N_PARAMETERS,
+            input_object_representation,
+            input_parameters_representation,
+        )
 
+    def execute(self):
+        """
+        Grid reorientation is handled at pixel level in normalise_demos().
+        Returns input object unchanged (no-op at the object level).
+        """
+        return ARCObject(
+            self.input_object_representation.get_colour_representation(),
+            self.input_object_representation.get_centre_representation(),
+            self.input_object_representation.get_shape_representation(),
+        )
+pass
+ 
 
 # Action utilities
 # -----------------------------------------------------------------------------
@@ -733,6 +875,21 @@ def program_heuristic(input_object, output_object, in_grid, out_grid, grid_size_
                 program_candidates.append(program_hash)
                 program_descriptions[program_hash] = (program.__class__, program_parameter)
 
+        # Object-Relations: project the object to the grid wall in the centre-delta
+        # direction (wall-boundary relation). Extent is read off the boundary, so a
+        # direction-only parameter generalises across grid sizes.
+        program_parameter = cleanup_centre(SSP_SPACE.bind(out_centre, SSP_SPACE.invert(in_centre)))[0]
+        if ENABLE_GROW_TO_BOUNDARY and (np.linalg.norm(program_parameter)):
+            program_parameter = [SSP_SPACE.encode(program_parameter / np.linalg.norm(program_parameter)).flatten()]
+            program = GrowToBoundaryOperation(input_object, program_parameter)
+            program.set_input_grid_size_representation(in_grid.get_size_representation())
+            program.set_current_grid(copy.deepcopy(out_grid).remove_object(output_object))
+            program_result = program.execute()
+            if (abs(np.sum(program_result.get_similarity_to(output_object)) - N_OBJ_PROPERTIES) < EPSILON):
+                program_hash = hash(program)
+                program_candidates.append(program_hash)
+                program_descriptions[program_hash] = (program.__class__, program_parameter)
+
     # Object has changed shape, so some reshape-based program applies
     elif (min(similarities) == similarities[2]):
         program_parameter = [out_shape]
@@ -749,6 +906,21 @@ def program_heuristic(input_object, output_object, in_grid, out_grid, grid_size_
         if (np.linalg.norm(program_parameter)):
             program_parameter = [SSP_SPACE.encode(program_parameter / np.linalg.norm(program_parameter)).flatten()]
             program = GrowOperation(input_object, program_parameter)
+            program.set_input_grid_size_representation(in_grid.get_size_representation())
+            program.set_current_grid(copy.deepcopy(out_grid).remove_object(output_object))
+            program_result = program.execute()
+            if (abs(np.sum(program_result.get_similarity_to(output_object)) - N_OBJ_PROPERTIES) < EPSILON):
+                program_hash = hash(program)
+                program_candidates.append(program_hash)
+                program_descriptions[program_hash] = (program.__class__, program_parameter)
+
+        # Object-Relations: project the object to the grid wall in the centre-delta
+        # direction (wall-boundary relation). Extent is read off the boundary, so a
+        # direction-only parameter generalises across grid sizes.
+        program_parameter = cleanup_centre(SSP_SPACE.bind(out_centre, SSP_SPACE.invert(in_centre)))[0]
+        if ENABLE_GROW_TO_BOUNDARY and (np.linalg.norm(program_parameter)):
+            program_parameter = [SSP_SPACE.encode(program_parameter / np.linalg.norm(program_parameter)).flatten()]
+            program = GrowToBoundaryOperation(input_object, program_parameter)
             program.set_input_grid_size_representation(in_grid.get_size_representation())
             program.set_current_grid(copy.deepcopy(out_grid).remove_object(output_object))
             program_result = program.execute()
