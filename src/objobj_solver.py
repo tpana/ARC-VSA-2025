@@ -953,9 +953,8 @@ class ObjectProgramPredictor(nn.Module):
                     print(f"The {i}th parameter for the {self.operation()} program is always just shape")
                     self.parameter_bypass[i] = (lambda x: torch.Tensor(x.get_shape_representation()))
 
-                # HyPRA Phase 4 patch: Check if orientation gets passed through
+                # HyPRA: check if orientation gets passed through
                 # (e.g. 25d487eb: output line direction == input pyramid orientation)
-                # hasattr guard keeps this backward-compat with plain ARCObjects.
                 elif (hasattr(parameter_flat_train_input[0], 'get_orientation_representation') and
                       all([np.allclose(parameter_flat_train_input[k].get_orientation_representation(),
                                        parameter_flat_train_output[1][k, i].detach().numpy())
@@ -963,7 +962,7 @@ class ObjectProgramPredictor(nn.Module):
                     print(f"The {i}th parameter for the {self.operation()} program is always just orientation (HyPRA)")
                     self.parameter_bypass[i] = (lambda x: torch.Tensor(x.get_orientation_representation()))
 
-                # HyPRA Phase 4 patch: Check if relational_role gets passed through
+                # HyPRA: check if relational_role gets passed through
                 elif (hasattr(parameter_flat_train_input[0], 'get_relational_role_representation') and
                       all([np.allclose(parameter_flat_train_input[k].get_relational_role_representation(),
                                        parameter_flat_train_output[1][k, i].detach().numpy())
@@ -1205,7 +1204,7 @@ def compute_action_set_cost(in_objects, object_program_distributions):
                     all([np.allclose(flat_in_objects[k].get_colour_representation(), these_parameters[k]) for k in range(len(flat_in_objects))]) or
                     all([np.allclose(flat_in_objects[k].get_centre_representation(), these_parameters[k]) for k in range(len(flat_in_objects))]) or
                     all([np.allclose(flat_in_objects[k].get_shape_representation(), these_parameters[k]) for k in range(len(flat_in_objects))]) or
-                    # HyPRA Phase 4 patch: orientation and relational_role passthrough cost = 1
+                    # HyPRA: orientation and relational_role passthrough treated as cost = 1
                     (hasattr(flat_in_objects[0], 'get_orientation_representation') and
                      all([np.allclose(flat_in_objects[k].get_orientation_representation(), these_parameters[k]) for k in range(len(flat_in_objects))])) or
                     (hasattr(flat_in_objects[0], 'get_relational_role_representation') and

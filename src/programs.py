@@ -70,7 +70,7 @@ GROW_OPERATION_N_PARAMETERS = 1
 FILL_OPERATION_N_PARAMETERS = 0
 HOLLOW_OPERATION_N_PARAMETERS = 0
 
-# HyPRA Phase 5 — grid-level reorientation (meta-operation, not in DSL pipeline)
+# HyPRA — grid-level reorientation (meta-operation, not in DSL pipeline)
 # NOTE: N_OPERATIONS stays 11 (IDs 0-10 = standard DSL ops).
 #       REORIENT (ID 11) exists outside the hitting-set / abduce machinery.
 REORIENT_OPERATION_ID          = 11
@@ -108,7 +108,7 @@ OPERATION_MAP = {
     FILL_OPERATION_ID: "Fill",
     HOLLOW_OPERATION_ID: "Hollow",
     
-    REORIENT_OPERATION_ID: "Reorient",   # HyPRA Phase 5
+    REORIENT_OPERATION_ID: "Reorient",   # HyPRA
     GROW_TO_BOUNDARY_OPERATION_ID: "GrowToBoundary",   # HyPRA Object-Relations
 }
 # -----------------------------------------------------------------------------
@@ -710,7 +710,7 @@ class HollowOperation(ARCOperation):
 # -----------------------------------------------------------------------------
 # (would subclass ARCOperation in the actual file)
     """
-    HyPRA Phase 5 — Grid-level dihedral reorientation.
+    HyPRA — Grid-level dihedral reorientation.
  
     Design rationale
     ----------------
